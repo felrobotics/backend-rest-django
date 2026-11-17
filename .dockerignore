@@ -1,0 +1,33 @@
+# Keep the build context small and free of secrets. Everything listed here is
+# never sent to the Docker daemon, so it can't end up in an image layer.
+
+# VCS and editors
+.git
+.gitignore
+.vscode
+.idea
+
+# Local virtualenv: the image builds its own in /opt/venv
+.venv
+
+# Secrets: real values come from env vars at runtime, never from the image
+.env
+.env.*
+!.env.example
+
+# Python and tool caches
+**/__pycache__
+**/*.py[cod]
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+.coverage.*
+htmlcov
+
+# Local-only files
+docker-compose*.yml
+compose*.yml
+media
+staticfiles
+*.log
