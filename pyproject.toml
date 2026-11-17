@@ -1,0 +1,36 @@
+[project]
+name = "backend-rest-django"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.44.4",
+    "celery[redis]>=5.7.0",
+    "django>=5.2,<5.3",
+    "django-environ>=0.14.0",
+    "django-storages>=1.14.6",
+    "djangorestframework>=3.16,<3.17",
+    "drf-spectacular>=0.30.0",
+    "gunicorn>=27.0.1",
+    "psycopg[binary]>=3.3.9",
+    "redis>=8.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "django-stubs>=6.1.2",
+    "djangorestframework-stubs>=3.18.2",
+    "factory-boy>=3.3.3",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "pytest-django>=4.14.0",
+    "ruff>=0.17.5",
+]
+
+[tool.pytest.ini_options]
+# --ds beats the DJANGO_SETTINGS_MODULE env var that docker compose injects from
+# .env (config.settings.local). An ini-file setting would lose to that env var,
+# so the tests would silently run with local settings.
+addopts = "--ds=config.settings.test"
+testpaths = ["apps"]
+python_files = ["test_*.py"]

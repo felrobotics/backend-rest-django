@@ -1,0 +1,177 @@
+# Local development only. AWS never uses this file (see CLAUDE.md):
+# RDS replaces `db`, ElastiCache replaces `redis`, and ECS runs the `prod` target.
+#
+#   cp .env.example .env
+#   docker compose up -d --build
+#   docker compose watch                    # optional, own terminal: restarts the worker on code changes
+#   docker compose --profile tools run --rm migrate
+#   docker compose exec api uv run pytest
+#   docker compose --profile prod-like up -d --build api-prod   # optional: the real prod image
+
+name: backend-rest-django
+
+# ---------------------------------------------------------------------------
+# Shared settings for containers that runs our code (api, worker, migrate).
+# ---------------------------------------------------------------------------
+x-shared: &shared
+  # The image is built once, by `api` (the only service with a `build:` section).
+  # The others reuse the tag instead of building the same image again.
+  image: backend-rest-django:dev
+  env_file: .env
+  volumes:
+    # Live code reload. The venv is in /opt/venv, so this mount doesn't hide it.
+    - .:/app
+  # tini as PID 1: forwards SIGTERM and reaps zombies, so Celery shuts down warm.
+  init: true
+  restart: unless-stopped
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  api:
+    <<: *shared
+    build:
+      context: .
+      target: dev
+      args:
+        # Match your host user so files written into the bind mount are yours.
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    command: ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+    ports:
+      # Bound to localhost only: not reachable from your network.
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      # Uses Python instead of curl so the image needs no extra tools.
+      # /health/ is the unauthenticated, DB-free liveness endpoint.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    <<: *shared
+    pull_policy: never  # image comes from the `api` build, never from a registry
+    command: ["celery", "-A", "config", "worker", "--loglevel=INFO"]
+    # Celery has no autoreload (unlike runserver), so without this the worker keeps
+    # running old task code. Active only under `docker compose watch` (or `up --watch`);
+    # the code arrives through the bind mount, so the
+    # action is a plain restart (a warm shutdown, thanks to `init: true`).
+    develop:
+      watch:
+        - action: restart
+          path: .
+          ignore:
+            - .git/
+            - .venv/
+            - .vscode/
+            - "**/__pycache__/"
+            - "**/tests/"
+            - "*.md"
+            - schema.yml
+    healthcheck:
+      # Asks this worker node (celery@<container hostname>) to answer a ping.
+      test: ["CMD-SHELL", "celery -A config inspect ping -d celery@$$HOSTNAME"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # One-off task, like the migration step that runs before each deploy in AWS.
+  # Never run migrations on container startup.
+  migrate:
+    <<: *shared
+    pull_policy: never  # image comes from the `api` build, never from a registry
+    profiles: ["tools"]
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    restart: "no"
+
+  # Runs the real `prod` image (gunicorn, no bind mount, no dev tools, read-only
+  # filesystem) so deployment problems show up here instead of in AWS:
+  #   docker compose --profile prod-like up -d --build api-prod
+  #   curl -H "X-Forwarded-Proto: https" http://127.0.0.1:8001/health/
+  # It stands in for the load balancer's TLS termination: send the header above,
+  # or SECURE_SSL_REDIRECT will answer every request with a redirect to https.
+  # Doesn't use `shared`: no bind mount, no restart policy, a different image.
+  api-prod:
+    profiles: ["prod-like"]
+    build:
+      context: .
+      target: prod
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+        GIT_SHA: ${GIT_SHA:-local}
+    image: backend-rest-django:prod
+    env_file: .env
+    environment:
+      # Override the local values that .env sets for the dev containers.
+      DJANGO_SETTINGS_MODULE: config.settings.production
+      DJANGO_DEBUG: "false"
+    init: true
+    # Containers are stateless in production: any attempt to write to the image
+    # filesystem fails here too. gunicorn's heartbeat files use /dev/shm.
+    read_only: true
+    tmpfs:
+      - /tmp
+    ports:
+      # 8001 so it can run next to `api` (8000).
+      - "127.0.0.1:8001:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Same /health/ the load balancer uses; the header skips the https redirect.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u; u.urlopen(u.Request('http://localhost:8000/health/', headers={'X-Forwarded-Proto': 'https'}), timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  db:
+    # Same major version as production RDS.
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      # CMD-SHELL takes ONE string; $$ stops compose from interpolating it.
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    # Keep the major.minor in line with the ElastiCache engine version.
+    image: redis:7.2
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
